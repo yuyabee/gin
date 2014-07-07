@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin/binding"
-	"github.com/julienschmidt/httprouter"
 	"html/template"
 	"log"
 	"math"
@@ -24,6 +23,28 @@ const (
 	MIMEXML2   = "text/xml"
 	MIMEPlain  = "text/plain"
 )
+
+// Param is a single URL parameter, consisting of a key and a value.
+type Param struct {
+	Key   string
+	Value string
+}
+
+// Params is a Param-slice, as returned by the router.
+// The slice is ordered, the first URL parameter is also the first slice value.
+// It is therefore save to read values by the index.
+type Params []Param
+
+// ByName returns the value of the first Param which key matches the given name.
+// If no matching Param is found, an empty string is returned.
+func (ps Params) ByName(name string) string {
+	for i := range ps {
+		if ps[i].Key == name {
+			return ps[i].Value
+		}
+	}
+	return ""
+}
 
 type (
 	HandlerFunc func(*Context)
@@ -45,7 +66,7 @@ type (
 		Writer   ResponseWriter
 		Keys     map[string]interface{}
 		Errors   ErrorMsgs
-		Params   httprouter.Params
+		Params   Params
 		Engine   *Engine
 		handlers []HandlerFunc
 		index    int8
@@ -66,7 +87,27 @@ type (
 		HTMLTemplates *template.Template
 		cache         sync.Pool
 		handlers404   []HandlerFunc
-		router        *httprouter.Router
+
+		// Enables automatic redirection if the current route can't be matched but a
+		// handler for the path with (without) the trailing slash exists.
+		// For example if /foo/ is requested but a route only exists for /foo, the
+		// client is redirected to /foo with http status code 301 for GET requests
+		// and 307 for all other request methods.
+		RedirectTrailingSlash bool
+
+		// If enabled, the router tries to fix the current request path, if no
+		// handle is registered for it.
+		// First superfluous path elements like ../ or // are removed.
+		// Afterwards the router does a case-insensitive lookup of the cleaned path.
+		// If a handle can be found for this route, the router makes a  redirection
+		// to the corrected path with status code 301 for GET requests and 307 for
+		// all other request methods.
+		// For example /FOO and /..//Foo could be redirected to /foo.
+		// RedirectTrailingSlash is independent of this option.
+		RedirectFixedPath bool
+
+		// router
+		trees map[string]*node
 	}
 )
 
@@ -106,8 +147,6 @@ func (a ErrorMsgs) String() string {
 func New() *Engine {
 	engine := &Engine{}
 	engine.RouterGroup = &RouterGroup{nil, "/", nil, engine}
-	engine.router = httprouter.New()
-	engine.router.NotFound = engine.handle404
 	engine.cache.New = func() interface{} {
 		return &Context{Engine: engine, Writer: &responseWriter{}}
 	}
@@ -142,8 +181,49 @@ func (engine *Engine) handle404(w http.ResponseWriter, req *http.Request) {
 }
 
 // ServeHTTP makes the router implement the http.Handler interface.
-func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	engine.router.ServeHTTP(w, req)
+func (r *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if root := r.trees[req.Method]; root != nil {
+		path := req.URL.Path
+
+		if handlers, ps, tsr := root.getValue(path); handlers != nil {
+			c := r.createContext(w, req, ps, handlers)
+			c.Next()
+			r.cache.Put(c)
+			return
+		} else if req.Method != "CONNECT" && path != "/" {
+			code := 301 // Permanent redirect, request with GET method
+			if req.Method != "GET" {
+				// Temporary redirect, request with same method
+				// As of Go 1.3, Go does not support status code 308.
+				code = 307
+			}
+
+			if tsr && r.RedirectTrailingSlash {
+				if path[len(path)-1] == '/' {
+					req.URL.Path = path[:len(path)-1]
+				} else {
+					req.URL.Path = path + "/"
+				}
+				http.Redirect(w, req, req.URL.String(), code)
+				return
+			}
+
+			// Try to fix the request path
+			if r.RedirectFixedPath {
+				fixedPath, found := root.findCaseInsensitivePath(
+					CleanPath(path),
+					r.RedirectTrailingSlash,
+				)
+				if found {
+					req.URL.Path = string(fixedPath)
+					http.Redirect(w, req, req.URL.String(), code)
+					return
+				}
+			}
+		}
+	}
+	// Handle 404
+	r.handle404(w, req)
 }
 
 func (engine *Engine) Run(addr string) {
@@ -156,7 +236,7 @@ func (engine *Engine) Run(addr string) {
 /********** ROUTES GROUPING *********/
 /************************************/
 
-func (engine *Engine) createContext(w http.ResponseWriter, req *http.Request, params httprouter.Params, handlers []HandlerFunc) *Context {
+func (engine *Engine) createContext(w http.ResponseWriter, req *http.Request, params Params, handlers []HandlerFunc) *Context {
 	c := engine.cache.Get().(*Context)
 	c.Writer.reset(w)
 	c.Req = req
@@ -197,11 +277,22 @@ func (group *RouterGroup) Group(component string, handlers ...HandlerFunc) *Rout
 func (group *RouterGroup) Handle(method, p string, handlers []HandlerFunc) {
 	p = path.Join(group.prefix, p)
 	handlers = group.combineHandlers(handlers)
-	group.engine.router.Handle(method, p, func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
-		c := group.engine.createContext(w, req, params, handlers)
-		c.Next()
-		group.engine.cache.Put(c)
-	})
+
+	if p[0] != '/' {
+		panic("path must begin with '/'")
+	}
+
+	if group.engine.trees == nil {
+		group.engine.trees = make(map[string]*node)
+	}
+
+	root := group.engine.trees[method]
+	if root == nil {
+		root = new(node)
+		group.engine.trees[method] = root
+	}
+
+	root.addRoute(p, handlers)
 }
 
 // POST is a shortcut for router.Handle("POST", path, handle)

@@ -205,6 +205,26 @@ func (group *RouterGroup) HEAD(path string, handlers ...HandlerFunc) {
 	group.Handle("HEAD", path, handlers)
 }
 
+// Resouce API
+type Resource interface {
+	CreateHandler() gin.HandlerFunc
+	ReadHandler() gin.HandlerFunc
+	UpdateHandler() gin.HandlerFunc
+	DeleteHandler() gin.HandlerFunc
+}
+
+// It defines
+//   POST: /path
+//   GET:  /path
+//   PUT:  /path/:id
+//   POST: /path/:id
+func (group *RouterGroup) CRUD(path string, resource Resource) {
+	group.Handle("POST", path, resource.CreateHandler)
+	group.Handle("GET", path, resource.ReadHandler)
+	group.Handle("PUT", path+"/:id", resource.UpdateHandler)
+	group.Handle("DELETE", path+"/:id", resource.DeleteHandler)
+}
+
 // Static serves files from the given file system root.
 // Internally a http.FileServer is used, therefore http.NotFound is used instead
 // of the Router's NotFound handler.
